@@ -1,1 +1,286 @@
+import os
+import re
+import threading
+import queue
+import tkinter as tk
+from tkinter import filedialog, messagebox
+
+from pypdf import PdfReader
+import pyttsx3
+
+
+CMD_SPEAK = "SPEAK"
+CMD_STOP = "STOP"
+CMD_QUIT = "QUIT"
+
+
+def split_into_chunks(text: str):
+    """
+    Split text into smaller speakable chunks so STOP/PAUSE works reliably.
+    """
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return []
+
+    # Split on sentence endings, but keep it simple and robust
+    parts = re.split(r"(?<=[.!?])\s+", text)
+    chunks = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        # If a "sentence" is huge, break it further
+        while len(p) > 350:
+            chunks.append(p[:350])
+            p = p[350:]
+        chunks.append(p)
+    return chunks
+
+
+class PDFPlayer:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("PDF → Audiobook Player")
+
+        # ---------- PDF state ----------
+        self.pdf_file = None
+        self.reader = None
+        self.total_pages = 0
+        self.page_index = 0
+        self.current_path = None
+
+        # ---------- UI (separate file name from status) ----------
+        self.file_label = tk.StringVar(value="File: (none)")
+        self.status = tk.StringVar(value="Status: Ready")
+        self.page_info = tk.StringVar(value="Page: - / -")
+
+        tk.Label(root, textvariable=self.file_label).pack(pady=4)
+        tk.Label(root, textvariable=self.status).pack(pady=4)
+        tk.Label(root, textvariable=self.page_info).pack(pady=2)
+
+        btns = tk.Frame(root)
+        btns.pack(pady=10)
+
+        tk.Button(btns, text="Open PDF", width=12, command=self.open_pdf).grid(
+            row=0, column=0, padx=4, pady=4)
+        tk.Button(btns, text="Play", width=12, command=self.play_current).grid(
+            row=0, column=1, padx=4, pady=4)
+        tk.Button(btns, text="Pause", width=12, command=self.pause).grid(
+            row=0, column=2, padx=4, pady=4)
+        tk.Button(btns, text="Stop", width=12, command=self.stop).grid(
+            row=0, column=3, padx=4, pady=4)
+
+        tk.Button(btns, text="Prev", width=12, command=self.prev_page).grid(
+            row=1, column=1, padx=4, pady=4)
+        tk.Button(btns, text="Next", width=12, command=self.next_page).grid(
+            row=1, column=2, padx=4, pady=4)
+
+        # ---------- TTS worker ----------
+        self.cmd_q: queue.Queue = queue.Queue()
+        # immediate stop request (checked between chunks)
+        self.stop_flag = threading.Event()
+
+        self.tts_thread = threading.Thread(
+            target=self._tts_worker, daemon=True)
+        self.tts_thread.start()
+
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    # ----------------- Helpers -----------------
+
+    def update_page_info(self):
+        if self.reader:
+            self.page_info.set(
+                f"Page: {self.page_index + 1} / {self.total_pages}")
+        else:
+            self.page_info.set("Page: - / -")
+
+    def _require_pdf(self) -> bool:
+        if not self.reader:
+            messagebox.showinfo("No PDF", "Please open a PDF first.")
+            return False
+        return True
+
+    # ----------------- PDF -----------------
+
+    def open_pdf(self):
+        path = filedialog.askopenfilename(
+            title="Select a PDF",
+            filetypes=[("PDF files", "*.pdf")]
+        )
+        if not path:
+            return
+
+        # Stop any speech, do NOT clear PDF state
+        self.stop_flag.set()
+        self.cmd_q.put((CMD_STOP, None))
+
+        try:
+            if self.pdf_file:
+                self.pdf_file.close()
+        except:
+            pass
+
+        try:
+            self.pdf_file = open(path, "rb")
+            self.reader = PdfReader(self.pdf_file, strict=False)
+            self.total_pages = len(self.reader.pages)
+            self.page_index = 0
+            self.current_path = path
+
+            self.file_label.set(f"File: {os.path.basename(path)}")
+            self.status.set("Status: Ready")
+            self.update_page_info()
+
+        except Exception as e:
+            self.reader = None
+            self.total_pages = 0
+            self.page_index = 0
+            self.current_path = None
+            self.file_label.set("File: (none)")
+            self.status.set("Status: Ready")
+            self.update_page_info()
+            messagebox.showerror("Error", f"Could not open PDF:\n{e}")
+
+    # ----------------- Playback -----------------
+
+    def play_current(self):
+        if not self._require_pdf():
+            return
+
+        # Clear stop and speak this page
+        self.stop_flag.clear()
+
+        try:
+            page = self.reader.pages[self.page_index]
+            text = (page.extract_text() or "").strip()
+        except Exception:
+            text = ""
+
+        if not text:
+            self.status.set("Status: No readable text on this page")
+            return
+
+        chunks = split_into_chunks(text)
+        if not chunks:
+            self.status.set("Status: No readable text on this page")
+            return
+
+        self.status.set("Status: Playing...")
+        self.cmd_q.put((CMD_SPEAK, chunks))
+
+    def pause(self):
+        # Pause = stop now, keep page
+        self.stop_flag.set()
+        self.cmd_q.put((CMD_STOP, None))
+        self.status.set("Status: Paused")
+
+    def stop(self):
+        # Stop = stop now, keep PDF and page
+        self.stop_flag.set()
+        self.cmd_q.put((CMD_STOP, None))
+        self.status.set("Status: Stopped")
+
+    # ----------------- Navigation -----------------
+
+    def next_page(self):
+        if not self._require_pdf():
+            return
+
+        self.stop_flag.set()
+        self.cmd_q.put((CMD_STOP, None))
+
+        if self.page_index < self.total_pages - 1:
+            self.page_index += 1
+
+        self.update_page_info()
+        self.status.set("Status: Ready")
+
+    def prev_page(self):
+        if not self._require_pdf():
+            return
+
+        self.stop_flag.set()
+        self.cmd_q.put((CMD_STOP, None))
+
+        if self.page_index > 0:
+            self.page_index -= 1
+
+        self.update_page_info()
+        self.status.set("Status: Ready")
+
+    # ----------------- TTS Worker -----------------
+
+    def _tts_worker(self):
+        # Create engine INSIDE the worker thread
+        engine = pyttsx3.init()
+
+        def reset_engine():
+            # Fully reset engine (helps after stop/pause so it can speak again)
+            nonlocal engine
+            try:
+                engine.stop()
+            except:
+                pass
+            try:
+                engine = pyttsx3.init()
+            except:
+                engine = pyttsx3.init()
+
+        while True:
+            cmd, payload = self.cmd_q.get()
+
+            if cmd == CMD_QUIT:
+                try:
+                    engine.stop()
+                except:
+                    pass
+                return
+
+            if cmd == CMD_STOP:
+                # Stop speaking immediately and reset engine so next Play works
+                reset_engine()
+                continue
+
+            if cmd == CMD_SPEAK:
+                chunks = payload
+
+                # Before speaking, ensure engine is in a clean state
+                try:
+                    engine.stop()
+                except:
+                    pass
+
+                for chunk in chunks:
+                    if self.stop_flag.is_set():
+                        break
+
+                    try:
+                        engine.say(chunk)
+                        engine.runAndWait()
+                    except:
+                        # If the engine errors, reset and stop this play request
+                        reset_engine()
+                        break
+
+                # After finishing (or stopping), reset stop flag only if it wasn't user-triggered
+                # (We leave it alone; Play clears it when the user presses Play again.)
+
+    # ----------------- Cleanup -----------------
+
+    def on_close(self):
+        self.stop_flag.set()
+        self.cmd_q.put((CMD_QUIT, None))
+        try:
+            if self.pdf_file:
+                self.pdf_file.close()
+        except:
+            pass
+        self.root.destroy()
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    PDFPlayer(root)
+    root.mainloop()
 
